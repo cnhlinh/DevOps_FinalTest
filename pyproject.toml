@@ -9,6 +9,11 @@ dependencies = [
     "uvicorn[standard]>=0.32.0",
 ]
 
+# Restrict setuptools auto-discovery to the app package only.
+# Without this, setuptools finds nginx/ and scripts/ and refuses to build.
+[tool.setuptools.packages.find]
+include = ["app*"]
+
 [project.optional-dependencies]
 dev = [
     "pytest>=8.3",

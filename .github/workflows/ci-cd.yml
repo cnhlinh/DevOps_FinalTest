@@ -141,8 +141,6 @@ jobs:
       packages: write
 
     outputs:
-      # Single deterministic tag used by the deploy job (sha-<short> form)
-      primary-tag: ${{ steps.primary.outputs.tag }}
       image-tags: ${{ steps.meta.outputs.tags }}
       image-version: ${{ steps.meta.outputs.version }}
 
@@ -189,26 +187,23 @@ jobs:
           provenance: true
           sbom: true
 
-      # Expose a single, unambiguous tag for downstream jobs.
-      # Format: ghcr.io/<owner>/<repo>:sha-<7-char-sha>
-      - name: Set primary tag
-        id: primary
-        run: |
-          echo "tag=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:sha-$(git rev-parse --short HEAD)" \
-            >> "$GITHUB_OUTPUT"
 
-# ── 5. DEPLOY — Blue-Green (runs on the CI runner, no production server needed)
-# ─────────────────────────────────────────────────────────────────────────────
-# The same runner that built the image acts as the "production" host.
-# docker compose brings up both slots + nginx locally, deploy.sh switches
-# traffic from blue → green, and the smoke-test hits localhost:80.
+# ── 5. DEPLOY — Blue-Green on your local machine ─────────────────────────────
+# runs-on: [self-hosted, local] targets the GitHub Actions runner agent
+# installed on your laptop (see scripts/setup-runner.sh).
 #
-# To run this exact job on your laptop without pushing to GitHub, install
-# `act` (https://github.com/nektos/act) and run:
-#   act push -W .github/workflows/ci-cd.yml -j deploy --var GITHUB_REF=refs/heads/main
+# Flow:
+#   GitHub triggers this job after build passes →
+#   runner agent (running on your laptop) picks it up →
+#   docker compose starts the blue-green stack on YOUR Docker daemon →
+#   nginx serves on http://localhost:80
+#
+# Setup (one-time):
+#   bash scripts/setup-runner.sh <repo-url> <runner-token>
+#   # token: GitHub repo → Settings → Actions → Runners → New self-hosted runner
 # ─────────────────────────────────────────────────────────────────────────────
   deploy:
-    name: "Deploy — Blue-Green (local Docker)"
+    name: "Deploy — Blue-Green (self-hosted local Docker)"
     needs: build
     runs-on: ubuntu-latest
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
@@ -218,56 +213,60 @@ jobs:
       url: http://localhost
 
     env:
-      APP_IMAGE: ${{ needs.build.outputs.primary-tag }}
+      APP_IMAGE: app:${{ github.sha }}
       COMPOSE: docker compose -f docker-compose.blue-green.yml
 
     steps:
       - uses: actions/checkout@v4
 
-      # The build job pushed to GHCR; log in so this runner can pull it.
-      - name: Log in to GHCR
-        uses: docker/login-action@v3
-        with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+      # Buildx may already be available via Docker Desktop; this is idempotent.
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
 
-      # nginx needs this file to exist before it starts.
-      - name: Bootstrap nginx upstream → blue
+      # Build locally — no registry needed.
+      # cache-from: type=gha pulls the layer cache written by the build job,
+      # so this typically completes in < 15 s even on a cold runner.
+      - name: Build image into local Docker daemon
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          load: true
+          tags: ${{ env.APP_IMAGE }}
+          build-args: APP_VERSION=${{ github.sha }}
+          cache-from: type=gha
+
+      - name: Confirm image is in local daemon
+        run: docker image inspect "$APP_IMAGE" --format 'ID={{ .Id }}'
+
+      - name: Bootstrap nginx upstream → blue (initial active slot)
         run: echo "server app-blue:8000;" > nginx/conf.d/upstream.conf
 
-      # Start both slots + nginx. --wait blocks until every healthcheck passes.
+      # --wait blocks until every container's HEALTHCHECK reports healthy.
       - name: Start blue-green stack
-        run: APP_IMAGE="$APP_IMAGE" $COMPOSE up -d --wait --quiet-pull
+        run: $COMPOSE up -d --wait
         timeout-minutes: 3
 
-      # Confirm initial traffic flows through nginx to the blue slot.
-      - name: Smoke-test initial state (blue slot)
+      - name: "Smoke-test — BEFORE deploy (blue active)"
         run: |
-          echo "Active slot before deploy:"
+          echo "Active upstream : $(cat nginx/conf.d/upstream.conf)"
           curl -fsSL http://localhost/health | python3 -m json.tool
 
-      # Execute the blue → green switch.
-      - name: Blue-Green deploy
+      # Switches traffic from blue → green; rolls back if green stays unhealthy.
+      - name: Blue-Green switch
         run: APP_IMAGE="$APP_IMAGE" bash scripts/deploy.sh
 
-      # Confirm traffic now flows to the green slot.
-      - name: Smoke-test after deploy (green slot)
+      - name: "Smoke-test — AFTER deploy (green active)"
         run: |
-          echo "Active slot after deploy:"
+          echo "Active upstream : $(cat nginx/conf.d/upstream.conf)"
           curl -fsSL http://localhost/health | python3 -m json.tool
 
-      # Always show container status so failures are easy to diagnose.
       - name: Container status
         if: always()
         run: $COMPOSE ps -a
 
-      # Always print nginx upstream to confirm the switch happened.
-      - name: Show active upstream
-        if: always()
-        run: cat nginx/conf.d/upstream.conf
-
-      # Clean up so the runner disk is not exhausted between workflow runs.
+      # Leave the stack running so the app stays up after the workflow finishes.
+      # Comment this out (or remove it) if you want a persistent deployment.
       - name: Teardown
         if: always()
         run: $COMPOSE down --volumes --remove-orphans

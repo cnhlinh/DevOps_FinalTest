@@ -75,6 +75,32 @@ act-pipeline:                 ## run entire workflow with act (needs: brew insta
 	  --secret SONAR_TOKEN=$${SONAR_TOKEN:-} \
 	  --secret SONAR_HOST_URL=$${SONAR_HOST_URL:-http://host.docker.internal:9000}
 
+# ── Self-hosted runner management ─────────────────────────────────────────────
+# REPO  = https://github.com/your-org/your-repo
+# TOKEN = one-time token from repo Settings → Actions → Runners → New runner
+
+.PHONY: runner-install
+runner-install:               ## install + register self-hosted runner (REPO= TOKEN= required)
+	@test -n "$(REPO)"  || (echo "Usage: make runner-install REPO=https://github.com/owner/repo TOKEN=xxx"; exit 1)
+	@test -n "$(TOKEN)" || (echo "Usage: make runner-install REPO=https://github.com/owner/repo TOKEN=xxx"; exit 1)
+	bash scripts/setup-runner.sh "$(REPO)" "$(TOKEN)"
+
+.PHONY: runner-status
+runner-status:                ## show runner service status
+	@cd ~/actions-runner && ./svc.sh status 2>/dev/null || echo "Runner not installed as a service. Is ~/actions-runner present?"
+
+.PHONY: runner-stop
+runner-stop:                  ## stop runner service
+	cd ~/actions-runner && ./svc.sh stop
+
+.PHONY: runner-start
+runner-start:                 ## start runner service
+	cd ~/actions-runner && ./svc.sh start
+
+.PHONY: runner-uninstall
+runner-uninstall:             ## unregister + remove runner service
+	cd ~/actions-runner && ./svc.sh stop && ./svc.sh uninstall && ./config.sh remove --token "$(TOKEN)"
+
 .PHONY: help
 help:                         ## show this help
 	@grep -E '^[a-zA-Z_-]+:.*##' $(MAKEFILE_LIST) \
