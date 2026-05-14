@@ -1,0 +1,273 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+  # Primary version used for sonar upload and Docker build
+  PRIMARY_PYTHON: "3.12"
+  PRIMARY_OS: ubuntu-latest
+
+# Limit concurrent runs on the same ref; cancel in-progress on new push
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# ══════════════════════════════════════════════════════════════════════════════
+jobs:
+
+# ── 1. LINT ───────────────────────────────────────────────────────────────────
+  lint:
+    name: "Lint (ruff)"
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PRIMARY_PYTHON }}
+          cache: pip
+
+      - name: Install ruff
+        run: pip install "ruff>=0.8"
+
+      - name: ruff — check (lint rules)
+        run: ruff check app/ tests/ --output-format=github
+
+      - name: ruff — format check
+        run: ruff format --check app/ tests/
+
+# ── 2. TEST (matrix: Python × OS) ────────────────────────────────────────────
+  test:
+    name: "Test py${{ matrix.python-version }} / ${{ matrix.os }}"
+    needs: lint
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
+        os: [ubuntu-latest, windows-latest, macos-latest]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Install project + dev deps
+        run: pip install -e ".[dev]"
+
+      - name: Run pytest with coverage
+        run: >
+          pytest tests/
+          --cov=app
+          --cov-report=xml:coverage.xml
+          --cov-report=term-missing
+          --junitxml=test-results.xml
+
+      # Upload coverage only from the single canonical matrix cell that
+      # SonarQube will consume (ubuntu + primary Python version).
+      - name: Upload coverage artifact
+        if: >
+          matrix.os == 'ubuntu-latest' &&
+          matrix.python-version == env.PRIMARY_PYTHON
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: coverage.xml
+          retention-days: 1
+
+      - name: Upload test-results artifact
+        if: >
+          matrix.os == 'ubuntu-latest' &&
+          matrix.python-version == env.PRIMARY_PYTHON
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results
+          path: test-results.xml
+          retention-days: 1
+
+# ── 3. SONARQUBE SCAN + QUALITY GATE ─────────────────────────────────────────
+  sonarqube:
+    name: "SonarQube — Scan & Quality Gate"
+    needs: test
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Full history required for accurate blame / new-code detection
+          fetch-depth: 0
+
+      - name: Download coverage report
+        uses: actions/download-artifact@v4
+        with:
+          name: coverage-report
+
+      # The scan action runs sonar-scanner and, because sonar.qualitygate.wait=true
+      # is set in sonar-project.properties, it polls until the Quality Gate result
+      # is available and returns exit code 1 when the gate fails — which fails this
+      # job and prevents build + deploy from running.
+      - name: SonarQube Scan (blocks on Quality Gate)
+        uses: SonarSource/sonarqube-scan-action@v3
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+
+      # Explicit quality-gate step: reads .scannerwork/report-task.txt written
+      # by the previous step and surfaces a clear FAILED status in the UI.
+      - name: SonarQube Quality Gate — enforce
+        uses: SonarSource/sonarqube-quality-gate-action@v1.1.0
+        timeout-minutes: 5
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+
+# ── 4. BUILD & PUSH DOCKER IMAGE ─────────────────────────────────────────────
+  build:
+    name: "Build & Push Docker Image"
+    needs: sonarqube
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    outputs:
+      # Single deterministic tag used by the deploy job (sha-<short> form)
+      primary-tag: ${{ steps.primary.outputs.tag }}
+      image-tags: ${{ steps.meta.outputs.tags }}
+      image-version: ${{ steps.meta.outputs.version }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract image metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=sha,prefix=sha-,format=short
+            type=ref,event=branch
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
+
+      - name: Build and push
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            APP_VERSION=${{ steps.meta.outputs.version }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          # Also load into the local Docker daemon so the deploy job can use it
+          # without needing a registry pull when running on the same runner.
+          load: ${{ github.event_name == 'pull_request' }}
+          provenance: true
+          sbom: true
+
+      # Expose a single, unambiguous tag for downstream jobs.
+      # Format: ghcr.io/<owner>/<repo>:sha-<7-char-sha>
+      - name: Set primary tag
+        id: primary
+        run: |
+          echo "tag=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:sha-$(git rev-parse --short HEAD)" \
+            >> "$GITHUB_OUTPUT"
+
+# ── 5. DEPLOY — Blue-Green (runs on the CI runner, no production server needed)
+# ─────────────────────────────────────────────────────────────────────────────
+# The same runner that built the image acts as the "production" host.
+# docker compose brings up both slots + nginx locally, deploy.sh switches
+# traffic from blue → green, and the smoke-test hits localhost:80.
+#
+# To run this exact job on your laptop without pushing to GitHub, install
+# `act` (https://github.com/nektos/act) and run:
+#   act push -W .github/workflows/ci-cd.yml -j deploy --var GITHUB_REF=refs/heads/main
+# ─────────────────────────────────────────────────────────────────────────────
+  deploy:
+    name: "Deploy — Blue-Green (local Docker)"
+    needs: build
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+
+    environment:
+      name: production
+      url: http://localhost
+
+    env:
+      APP_IMAGE: ${{ needs.build.outputs.primary-tag }}
+      COMPOSE: docker compose -f docker-compose.blue-green.yml
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # The build job pushed to GHCR; log in so this runner can pull it.
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # nginx needs this file to exist before it starts.
+      - name: Bootstrap nginx upstream → blue
+        run: echo "server app-blue:8000;" > nginx/conf.d/upstream.conf
+
+      # Start both slots + nginx. --wait blocks until every healthcheck passes.
+      - name: Start blue-green stack
+        run: APP_IMAGE="$APP_IMAGE" $COMPOSE up -d --wait --quiet-pull
+        timeout-minutes: 3
+
+      # Confirm initial traffic flows through nginx to the blue slot.
+      - name: Smoke-test initial state (blue slot)
+        run: |
+          echo "Active slot before deploy:"
+          curl -fsSL http://localhost/health | python3 -m json.tool
+
+      # Execute the blue → green switch.
+      - name: Blue-Green deploy
+        run: APP_IMAGE="$APP_IMAGE" bash scripts/deploy.sh
+
+      # Confirm traffic now flows to the green slot.
+      - name: Smoke-test after deploy (green slot)
+        run: |
+          echo "Active slot after deploy:"
+          curl -fsSL http://localhost/health | python3 -m json.tool
+
+      # Always show container status so failures are easy to diagnose.
+      - name: Container status
+        if: always()
+        run: $COMPOSE ps -a
+
+      # Always print nginx upstream to confirm the switch happened.
+      - name: Show active upstream
+        if: always()
+        run: cat nginx/conf.d/upstream.conf
+
+      # Clean up so the runner disk is not exhausted between workflow runs.
+      - name: Teardown
+        if: always()
+        run: $COMPOSE down --volumes --remove-orphans

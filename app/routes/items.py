@@ -1,19 +1,17 @@
-from typing import List
-
 from fastapi import APIRouter, HTTPException
 
 from app.models import Item, ItemCreate
 
 router = APIRouter()
 
-_items: List[Item] = [
+_items: list[Item] = [
     Item(id=1, name="Widget", description="A standard widget", price=9.99),
     Item(id=2, name="Gadget", description="An advanced gadget", price=29.99),
 ]
 _counter = 3
 
 
-@router.get("/", response_model=List[Item])
+@router.get("/", response_model=list[Item])
 async def list_items():
     return _items
 

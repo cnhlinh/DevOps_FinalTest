@@ -1,0 +1,1 @@
+1. Multi-stage build is used in Dockerfile to significantly reduce the final image size and mitigate vulnerabilities. Multi-stage build typically seperates the build stage and production image build, resulting into a final image without no longer needed build tool, which can contain vulnerabilities, insecure tool that may allow attacker to exploit 
