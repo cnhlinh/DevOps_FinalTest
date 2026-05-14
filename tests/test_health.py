@@ -17,5 +17,3 @@ def test_health_has_version(client):
 def test_health_has_environment(client):
     data = client.get("/health").json()
     assert "environment" in data
-
-
