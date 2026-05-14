@@ -111,6 +111,7 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: coverage-report
+          path: .
 
       # The scan action runs sonar-scanner and, because sonar.qualitygate.wait=true
       # is set in sonar-project.properties, it polls until the Quality Gate result
@@ -192,7 +193,7 @@ jobs:
   deploy:
     name: "Deploy — Blue-Green"
     needs: build
-    runs-on: [self-hosted, local]
+    runs-on: [self-hosted, macOS, ARM64]
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
 
     environment:
