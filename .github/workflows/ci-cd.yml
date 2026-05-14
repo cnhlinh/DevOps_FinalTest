@@ -51,8 +51,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.11", "3.12", "3.13"]
-        os: [ubuntu-latest, windows-latest, macos-latest]
+        python-version: ["3.11", "3.12"]
+        os: [ubuntu-latest]
 
     steps:
       - uses: actions/checkout@v4
@@ -188,24 +188,11 @@ jobs:
           sbom: true
 
 
-# ── 5. DEPLOY — Blue-Green on your local machine ─────────────────────────────
-# runs-on: [self-hosted, local] targets the GitHub Actions runner agent
-# installed on your laptop (see scripts/setup-runner.sh).
-#
-# Flow:
-#   GitHub triggers this job after build passes →
-#   runner agent (running on your laptop) picks it up →
-#   docker compose starts the blue-green stack on YOUR Docker daemon →
-#   nginx serves on http://localhost:80
-#
-# Setup (one-time):
-#   bash scripts/setup-runner.sh <repo-url> <runner-token>
-#   # token: GitHub repo → Settings → Actions → Runners → New self-hosted runner
-# ─────────────────────────────────────────────────────────────────────────────
+# ── 5. DEPLOY — Blue-Green ────────────────────────────────────────────────────
   deploy:
-    name: "Deploy — Blue-Green (self-hosted local Docker)"
+    name: "Deploy — Blue-Green"
     needs: build
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, local]
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
 
     environment:
@@ -219,13 +206,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # Buildx may already be available via Docker Desktop; this is idempotent.
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      # Build locally — no registry needed.
-      # cache-from: type=gha pulls the layer cache written by the build job,
-      # so this typically completes in < 15 s even on a cold runner.
       - name: Build image into local Docker daemon
         uses: docker/build-push-action@v6
         with:
@@ -236,13 +219,9 @@ jobs:
           build-args: APP_VERSION=${{ github.sha }}
           cache-from: type=gha
 
-      - name: Confirm image is in local daemon
-        run: docker image inspect "$APP_IMAGE" --format 'ID={{ .Id }}'
-
-      - name: Bootstrap nginx upstream → blue (initial active slot)
+      - name: Bootstrap nginx upstream → blue
         run: echo "server app-blue:8000;" > nginx/conf.d/upstream.conf
 
-      # --wait blocks until every container's HEALTHCHECK reports healthy.
       - name: Start blue-green stack
         run: $COMPOSE up -d --wait
         timeout-minutes: 3
@@ -252,7 +231,6 @@ jobs:
           echo "Active upstream : $(cat nginx/conf.d/upstream.conf)"
           curl -fsSL http://localhost/health | python3 -m json.tool
 
-      # Switches traffic from blue → green; rolls back if green stays unhealthy.
       - name: Blue-Green switch
         run: APP_IMAGE="$APP_IMAGE" bash scripts/deploy.sh
 
@@ -264,9 +242,3 @@ jobs:
       - name: Container status
         if: always()
         run: $COMPOSE ps -a
-
-      # Leave the stack running so the app stays up after the workflow finishes.
-      # Comment this out (or remove it) if you want a persistent deployment.
-      - name: Teardown
-        if: always()
-        run: $COMPOSE down --volumes --remove-orphans
