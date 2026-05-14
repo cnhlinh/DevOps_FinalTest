@@ -1,6 +1,6 @@
 from fastapi import FastAPI
 
-from app.routes import health, items
+from app.routes import health
 
 app = FastAPI(
     title="DevOps Pipeline API",
@@ -9,9 +9,3 @@ app = FastAPI(
 )
 
 app.include_router(health.router)
-app.include_router(items.router, prefix="/items", tags=["items"])
-
-
-@app.get("/", tags=["root"])
-async def root():
-    return {"message": "DevOps Pipeline API", "version": "0.1.0"}

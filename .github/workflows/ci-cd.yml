@@ -73,8 +73,6 @@ jobs:
           --cov-report=term-missing
           --junitxml=test-results.xml
 
-      # Upload coverage only from the single canonical matrix cell that
-      # SonarQube will consume (ubuntu + primary Python version).
       - name: Upload coverage artifact
         if: >
           matrix.os == 'ubuntu-latest' &&

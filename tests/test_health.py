@@ -19,12 +19,3 @@ def test_health_has_environment(client):
     assert "environment" in data
 
 
-def test_root_returns_200(client):
-    response = client.get("/")
-    assert response.status_code == 200
-
-
-def test_root_has_message(client):
-    data = client.get("/").json()
-    assert "message" in data
-    assert "version" in data

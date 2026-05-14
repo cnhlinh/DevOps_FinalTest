@@ -64,6 +64,9 @@ addopts = "-v --tb=short"
 [tool.coverage.run]
 source = ["app"]
 omit = ["tests/*"]
+# Relative paths in coverage.xml so SonarQube can match files regardless
+# of whether the scanner runs natively or inside a Docker container.
+relative_files = true
 
 [tool.coverage.report]
 show_missing = true
