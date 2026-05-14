@@ -2,6 +2,7 @@
 
 A FastAPI application with a complete CI/CD pipeline: lint → test → SonarQube quality gate → Docker build → zero-downtime blue-green deployment.
 
+GitHub link: https://github.com/cnhlinh/DevOps_FinalTest
 ---
 
 ## Pipeline
